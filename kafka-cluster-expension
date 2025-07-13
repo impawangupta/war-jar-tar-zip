@@ -1,0 +1,1469 @@
+#!/bin/bash
+
+# Enhanced Kafka Cluster Expansion Planner v3.0
+# Smart expansion planning with timing predictions, sustainability analysis, and customizable growth rates
+# Features: timing prediction, expansion sustainability, next expansion timing, configurable growth rates
+# Always reads partition data from input files
+
+set -euo pipefail
+
+# Configuration constants
+readonly MAX_PARTITIONS_PER_BROKER=4000
+readonly HEALTH_THRESHOLD_PERCENT=80
+readonly DEFAULT_ANNUAL_GROWTH_PERCENT=15
+readonly BROKER_MULTIPLE=3
+
+# Configurable growth parameters
+ANNUAL_GROWTH_PERCENT=${KAFKA_GROWTH_RATE:-$DEFAULT_ANNUAL_GROWTH_PERCENT}
+
+# Multi-scenario growth rates (base ±5%)
+LOW_GROWTH_PERCENT=$((ANNUAL_GROWTH_PERCENT - 5))
+HIGH_GROWTH_PERCENT=$((ANNUAL_GROWTH_PERCENT + 5))
+
+# Ensure minimum growth rate of 1%
+if [ "$LOW_GROWTH_PERCENT" -lt 1 ]; then
+    LOW_GROWTH_PERCENT=1
+fi
+
+# Contract and cost considerations
+readonly CONTRACT_RENEWAL_MONTH=9  # September
+readonly COST_PER_BROKER_ANNUAL_PRODUCTION=${KAFKA_COST_PER_BROKER:-5608.98}  # Default $5,608.98/year per production broker (Confluent license)
+readonly COST_OPTIMIZATION_THRESHOLD_MONTHS=6  # Minimum months to justify expansion cost
+
+# Function to calculate cost per broker based on environment
+calculate_cost_per_broker() {
+    local environment="$1"
+    
+    # Convert to lowercase for case-insensitive comparison
+    local env_lower=$(echo "$environment" | tr '[:upper:]' '[:lower:]')
+    
+    case "$env_lower" in
+        *"dev"*|*"development"*)
+            echo "0"  # Dev environments are free
+            ;;
+        *"prod"*|*"production"*)
+            echo "$COST_PER_BROKER_ANNUAL_PRODUCTION"  # Full production cost
+            ;;
+        *)
+            # All other environments (staging, test, etc.) are half of production cost
+            echo "$(echo "scale=2; $COST_PER_BROKER_ANNUAL_PRODUCTION / 2" | bc)"
+            ;;
+    esac
+}
+
+# Environment variable names
+readonly ENV_DATACENTER="KAFKA_DATACENTER"
+readonly ENV_CLUSTER_TYPE="KAFKA_CLUSTER_TYPE"
+readonly ENV_ENVIRONMENT="KAFKA_ENVIRONMENT"
+readonly ENV_FILE_PREFIX="KAFKA_FILE_PREFIX"
+readonly ENV_GROWTH_RATE="KAFKA_GROWTH_RATE"
+readonly ENV_COST_PER_BROKER="KAFKA_COST_PER_BROKER"
+
+# Colors for output formatting
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly PURPLE='\033[0;35m'
+readonly NC='\033[0m' # No Color
+
+# Global variables for user inputs
+DATACENTER=""
+CLUSTER_TYPE=""
+ENVIRONMENT=""
+FILE_PREFIX=""
+DETAILED_FILE=""
+TABULAR_FILE=""
+
+# Function to print colored output
+print_colored() {
+    local color=$1
+    local message=$2
+    echo -e "${color}${message}${NC}"
+}
+
+# Function to validate input (not empty and no special characters)
+validate_input() {
+    local input="$1"
+    local field_name="$2"
+    
+    # Check if empty
+    if [[ -z "$input" ]]; then
+        return 1
+    fi
+    
+    # Check for invalid characters (only alphanumeric, underscore, and hyphen allowed)
+    if [[ ! "$input" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        print_colored "$RED" "$field_name contains invalid characters. Only letters, numbers, underscores, and hyphens are allowed."
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function to check for duplicate entries
+check_duplicate_entry() {
+    if [[ ! -f "$TABULAR_FILE" ]]; then
+        # File doesn't exist, no duplicates possible
+        return 0
+    fi
+    
+    print_colored "$CYAN" "🔍 Checking for duplicate entries..."
+    
+    # Search for existing combination of DATACENTER|CLUSTER_TYPE|ENVIRONMENT
+    local search_pattern="${DATACENTER}.*${CLUSTER_TYPE}.*${ENVIRONMENT}"
+    
+    if grep -q "$search_pattern" "$TABULAR_FILE"; then
+        print_colored "$RED" "❌ DUPLICATE ENTRY DETECTED!"
+        echo
+        print_colored "$RED" "Found existing entry for combination:"
+        print_colored "$RED" "  📍 Data Center: $DATACENTER"
+        print_colored "$RED" "  🖥️  Cluster Type: $CLUSTER_TYPE"
+        print_colored "$RED" "  🌍 Environment: $ENVIRONMENT"
+        echo
+        print_colored "$YELLOW" "🔧 CORRECTIVE ACTIONS:"
+        echo "1. Use different environment variables or input values"
+        echo "2. Remove the existing entry from $TABULAR_FILE if you want to replace it"
+        echo "3. Use a different file prefix to create separate analysis files"
+        echo
+        print_colored "$BLUE" "Existing entries in $TABULAR_FILE:"
+        echo "$(grep -v '^#' "$TABULAR_FILE" | head -10)"
+        echo
+        exit 1
+    fi
+    
+    print_colored "$GREEN" "✅ No duplicate entries found. Proceeding..."
+    echo
+}
+
+# Function to calculate mid-term expansion needs
+calculate_midterm_expansion() {
+    local total_partitions_after_initial_expansion=$1
+    local max_partitions_after_initial_expansion=$2
+    local brokers_after_initial_expansion=$3
+    
+    local health_threshold=$((MAX_PARTITIONS_PER_BROKER * HEALTH_THRESHOLD_PERCENT / 100))
+    
+    # Calculate 6-month growth (approximately 7.5% for 15% annual)
+    local midterm_growth=8  # Simplified to 8% for 6 months
+    local projected_6mo_max=$((max_partitions_after_initial_expansion * (100 + midterm_growth) / 100))
+    local projected_6mo_total=$((total_partitions_after_initial_expansion * (100 + midterm_growth) / 100))
+    
+    local midterm_expansion_needed=false
+    local midterm_brokers_to_add=0
+    local midterm_reason=""
+    
+    if [ "$projected_6mo_max" -gt "$health_threshold" ]; then
+        midterm_expansion_needed=true
+        midterm_reason="Mid-year growth will exceed health threshold"
+        
+        # Calculate additional brokers needed
+        local required_brokers=$(( (projected_6mo_total + health_threshold - 1) / health_threshold ))
+        required_brokers=$(( ((required_brokers + 2) / 3) * 3 ))  # Round up to multiple of 3
+        
+        if [ "$required_brokers" -gt "$brokers_after_initial_expansion" ]; then
+            midterm_brokers_to_add=$((required_brokers - brokers_after_initial_expansion))
+        fi
+    fi
+    
+    echo "$midterm_expansion_needed|$midterm_brokers_to_add|$midterm_reason|$projected_6mo_max|$projected_6mo_total"
+}
+
+# Function to read from environment variables
+read_from_environment() {
+    local found_env_vars=false
+    
+    print_colored "$BLUE" "=== KAFKA CLUSTER EXPANSION PLANNER v3.0 ==="
+    print_colored "$CYAN" "🔍 Checking for environment variables..."
+    echo
+    
+    # Check KAFKA_DATACENTER
+    if [[ -n "${!ENV_DATACENTER:-}" ]]; then
+        local env_datacenter=$(echo "${!ENV_DATACENTER}" | tr '[:lower:]' '[:upper:]' | tr -d ' ')
+        if validate_input "$env_datacenter" "KAFKA_DATACENTER"; then
+            DATACENTER="$env_datacenter"
+            print_colored "$GREEN" "  ✅ $ENV_DATACENTER: $DATACENTER"
+            found_env_vars=true
+        else
+            print_colored "$RED" "  ❌ $ENV_DATACENTER has invalid value: ${!ENV_DATACENTER}"
+        fi
+    else
+        print_colored "$YELLOW" "  ⚠️  $ENV_DATACENTER: Not set"
+    fi
+    
+    # Check KAFKA_CLUSTER_TYPE
+    if [[ -n "${!ENV_CLUSTER_TYPE:-}" ]]; then
+        local env_cluster_type=$(echo "${!ENV_CLUSTER_TYPE}" | tr '[:lower:]' '[:upper:]' | tr -d ' ')
+        if validate_input "$env_cluster_type" "KAFKA_CLUSTER_TYPE"; then
+            CLUSTER_TYPE="$env_cluster_type"
+            print_colored "$GREEN" "  ✅ $ENV_CLUSTER_TYPE: $CLUSTER_TYPE"
+            found_env_vars=true
+        else
+            print_colored "$RED" "  ❌ $ENV_CLUSTER_TYPE has invalid value: ${!ENV_CLUSTER_TYPE}"
+        fi
+    else
+        print_colored "$YELLOW" "  ⚠️  $ENV_CLUSTER_TYPE: Not set"
+    fi
+    
+    # Check KAFKA_ENVIRONMENT
+    if [[ -n "${!ENV_ENVIRONMENT:-}" ]]; then
+        local env_environment=$(echo "${!ENV_ENVIRONMENT}" | sed 's/\b\w/\U&/g' | tr -d ' ')
+        if validate_input "$env_environment" "KAFKA_ENVIRONMENT"; then
+            ENVIRONMENT="$env_environment"
+            print_colored "$GREEN" "  ✅ $ENV_ENVIRONMENT: $ENVIRONMENT"
+            found_env_vars=true
+        else
+            print_colored "$RED" "  ❌ $ENV_ENVIRONMENT has invalid value: ${!ENV_ENVIRONMENT}"
+        fi
+    else
+        print_colored "$YELLOW" "  ⚠️  $ENV_ENVIRONMENT: Not set"
+    fi
+    
+    # Check KAFKA_FILE_PREFIX
+    if [[ -n "${!ENV_FILE_PREFIX:-}" ]]; then
+        local env_file_prefix=$(echo "${!ENV_FILE_PREFIX}" | tr -d ' ')
+        if validate_input "$env_file_prefix" "KAFKA_FILE_PREFIX"; then
+            FILE_PREFIX="$env_file_prefix"
+            print_colored "$GREEN" "  ✅ $ENV_FILE_PREFIX: $FILE_PREFIX"
+            found_env_vars=true
+        else
+            print_colored "$RED" "  ❌ $ENV_FILE_PREFIX has invalid value: ${!ENV_FILE_PREFIX}"
+        fi
+    else
+        print_colored "$YELLOW" "  ⚠️  $ENV_FILE_PREFIX: Not set"
+    fi
+    
+    if [ "$found_env_vars" = true ]; then
+        echo
+        print_colored "$CYAN" "📋 Environment variables detected and validated."
+    else
+        echo
+        print_colored "$CYAN" "📋 No valid environment variables found."
+    fi
+    
+    echo
+}
+
+# Function to show environment variable usage
+show_env_usage() {
+    print_colored "$CYAN" "💡 Environment Variable Usage:"
+    echo "  export KAFKA_DATACENTER=\"ATL\""
+    echo "  export KAFKA_CLUSTER_TYPE=\"LOC\""
+    echo "  export KAFKA_ENVIRONMENT=\"Production\""
+    echo "  export KAFKA_FILE_PREFIX=\"25-25_cluster_planning\""
+    echo "  export KAFKA_GROWTH_RATE=\"15\"  # Annual growth percentage (default: 15)"
+    echo "  export KAFKA_COST_PER_BROKER=\"5608.98\"  # Annual cost per production broker in USD (default: 5608.98)"
+    echo ""
+    echo "📋 Cost Structure:"
+    echo "  • Production environments: Full cost (\$5608.98/year)"
+    echo "  • Development environments: Free (\$0/year)"
+    echo "  • Other environments (staging, test, etc.): Half cost (\$2804.49/year)"
+    echo
+}
+
+# Function to show usage information
+show_usage() {
+    echo "Kafka Cluster Expansion Planner v3.0"
+    echo "====================================="
+    echo
+    echo "This script analyzes Kafka cluster partition distribution and recommends expansion."
+    echo "Features: expansion timing prediction, sustainability analysis, next expansion timing,"
+    echo "configurable growth rates, Confluent contract cost optimization, and smart planning."
+    echo "Includes September contract renewal timing and cost-aware recommendations."
+    echo "Partition data must be provided via an input file."
+    echo
+    echo "Usage:"
+    echo "  $0 <partition_file>    # Analyze partition data from file"
+    echo "  $0 --example           # Run with built-in example data"
+    echo "  $0 --help             # Show this help message"
+    echo
+    echo "Input File Format:"
+    echo "  The input file should contain one partition count per line:"
+    echo "    3178"
+    echo "    3247" 
+    echo "    3121"
+    echo "    ..."
+    echo
+    show_env_usage
+    echo "Examples:"
+    echo
+    echo "  # 1. Collect partition data first"
+    echo "  kfk_brokers.list.partitions_count | grep -v us.saas | tr -s '\\n' > partition_data.txt"
+    echo
+    echo "  # 2. Set environment variables (optional)"
+    echo "  export KAFKA_DATACENTER=\"ATL\""
+    echo "  export KAFKA_CLUSTER_TYPE=\"LOC\""
+    echo "  export KAFKA_ENVIRONMENT=\"Production\""
+    echo "  export KAFKA_FILE_PREFIX=\"25-25_cluster_planning\""
+    echo "  export KAFKA_GROWTH_RATE=\"20\"  # Use 20% annual growth instead of default 15%"
+    echo "  export KAFKA_COST_PER_BROKER=\"5608.98\"  # Set custom cost per production broker per year"
+    echo
+    echo "  # 3. Run analysis"
+    echo "  $0 partition_data.txt"
+    echo
+    echo "  # Or run with example data for testing"
+    echo "  $0 --example"
+    echo
+}
+
+# Function to get missing inputs from user
+get_missing_inputs() {
+    local need_user_input=false
+    
+    # Check what inputs are missing
+    if [[ -z "$DATACENTER" || -z "$CLUSTER_TYPE" || -z "$ENVIRONMENT" || -z "$FILE_PREFIX" ]]; then
+        need_user_input=true
+        print_colored "$YELLOW" "📝 Some required information is missing. Please provide the following:"
+        echo
+    fi
+    
+    if [ "$need_user_input" = false ]; then
+        return
+    fi
+    
+    # Get and validate datacenter name
+    if [[ -z "$DATACENTER" ]]; then
+        while true; do
+            read -p "📍 Enter Data Center name (e.g., ATL, NYC, LON): " input
+            input=$(echo "$input" | tr '[:lower:]' '[:upper:]' | tr -d ' ')
+            if validate_input "$input" "Data Center name"; then
+                DATACENTER="$input"
+                break
+            fi
+            print_colored "$RED" "Data Center name cannot be empty and can only contain letters, numbers, underscores, and hyphens."
+        done
+    fi
+    
+    # Get and validate cluster type
+    if [[ -z "$CLUSTER_TYPE" ]]; then
+        while true; do
+            read -p "🖥️  Enter Cluster Type (e.g., LOC, AGR, PROD, DEV): " input
+            input=$(echo "$input" | tr '[:lower:]' '[:upper:]' | tr -d ' ')
+            if validate_input "$input" "Cluster Type"; then
+                CLUSTER_TYPE="$input"
+                break
+            fi
+            print_colored "$RED" "Cluster Type cannot be empty and can only contain letters, numbers, underscores, and hyphens."
+        done
+    fi
+    
+    # Get and validate environment type
+    if [[ -z "$ENVIRONMENT" ]]; then
+        while true; do
+            read -p "🌍 Enter Environment Type (e.g., Production, Staging, Development): " input
+            input=$(echo "$input" | sed 's/\b\w/\U&/g' | tr -d ' ')
+            if validate_input "$input" "Environment Type"; then
+                ENVIRONMENT="$input"
+                break
+            fi
+            print_colored "$RED" "Environment Type cannot be empty and can only contain letters, numbers, underscores, and hyphens."
+        done
+    fi
+    
+    # Get and validate file prefix
+    if [[ -z "$FILE_PREFIX" ]]; then
+        while true; do
+            read -p "📁 Enter file prefix for reports (e.g., 25-25_cluster_planning): " input
+            input=$(echo "$input" | tr -d ' ')
+            if [[ -z "$input" ]]; then
+                input="cluster_analysis_$(date +%Y%m%d_%H%M%S)"
+                print_colored "$YELLOW" "Using default prefix: $input"
+            fi
+            if validate_input "$input" "File prefix"; then
+                FILE_PREFIX="$input"
+                break
+            fi
+            print_colored "$RED" "File prefix can only contain letters, numbers, underscores, and hyphens."
+        done
+    fi
+}
+
+# Function to finalize configuration
+finalize_configuration() {
+    # Create filenames with markdown extensions
+    DETAILED_FILE="${FILE_PREFIX}_detailed.md"
+    TABULAR_FILE="${FILE_PREFIX}_summary.md"
+    
+    # Check for duplicate entries before proceeding
+    check_duplicate_entry
+    
+    echo
+    print_colored "$GREEN" "✅ Final Configuration:"
+    echo "  📍 Data Center: $DATACENTER"
+    echo "  🖥️  Cluster Type: $CLUSTER_TYPE"
+    echo "  🌍 Environment: $ENVIRONMENT"
+    echo "  📁 File Prefix: $FILE_PREFIX"
+    echo "  📄 Detailed Analysis File: $DETAILED_FILE"
+    echo "  📊 Tabular Summary File: $TABULAR_FILE"
+    echo
+    
+    # Confirm inputs only if we got user input (not all from env vars)
+    if [[ -z "${!ENV_DATACENTER:-}" || -z "${!ENV_CLUSTER_TYPE:-}" || -z "${!ENV_ENVIRONMENT:-}" || -z "${!ENV_FILE_PREFIX:-}" ]]; then
+        while true; do
+            read -p "Is this configuration correct? (y/n): " confirm
+            case $confirm in
+                [Yy]|[Yy][Ee][Ss])
+                    print_colored "$GREEN" "✅ Proceeding with analysis..."
+                    echo
+                    break
+                    ;;
+                [Nn]|[Nn][Oo])
+                    print_colored "$YELLOW" "Restarting input collection..."
+                    DATACENTER=""
+                    CLUSTER_TYPE=""
+                    ENVIRONMENT=""
+                    FILE_PREFIX=""
+                    get_missing_inputs
+                    finalize_configuration
+                    return
+                    ;;
+                *)
+                    print_colored "$RED" "Please answer 'y' or 'n'."
+                    ;;
+            esac
+        done
+    else
+        print_colored "$GREEN" "✅ Using environment variables. Proceeding with analysis..."
+        echo
+    fi
+}
+
+# Function to validate and read partition file
+read_partition_file() {
+    local file_path="$1"
+    
+    if [[ ! -f "$file_path" ]]; then
+        print_colored "$RED" "❌ Error: File '$file_path' not found"
+        print_colored "$YELLOW" "💡 Tip: Create partition data file first:"
+        echo "  kfk_brokers.list.partitions_count | grep -v us.saas | tr -s '\\n' > partition_data.txt"
+        exit 1
+    fi
+    
+    if [[ ! -r "$file_path" ]]; then
+        print_colored "$RED" "❌ Error: Cannot read file '$file_path' (permission denied)"
+        exit 1
+    fi
+    
+    if [[ ! -s "$file_path" ]]; then
+        print_colored "$RED" "❌ Error: File '$file_path' is empty"
+        exit 1
+    fi
+    
+    print_colored "$BLUE" "📊 Reading partition data from file: $file_path"
+    
+    # Read and validate file contents
+    local input_data=$(cat "$file_path")
+    local line_count=0
+    local valid_lines=0
+    
+    while IFS= read -r line; do
+        ((line_count++))
+        if [[ "$line" =~ ^[0-9]+$ ]] && [ "$line" -gt 0 ]; then
+            ((valid_lines++))
+        elif [[ -n "$line" ]] && [[ ! "$line" =~ ^[[:space:]]*$ ]]; then
+            print_colored "$YELLOW" "⚠️  Warning: Line $line_count contains invalid data: '$line' (skipping)"
+        fi
+    done <<< "$input_data"
+    
+    if [ "$valid_lines" -eq 0 ]; then
+        print_colored "$RED" "❌ Error: No valid partition counts found in file '$file_path'"
+        print_colored "$YELLOW" "Expected format: one positive integer per line"
+        exit 1
+    fi
+    
+    print_colored "$GREEN" "✅ Found $valid_lines valid partition counts in file"
+    echo
+    
+    echo "$input_data"
+}
+
+# Function to calculate statistics from partition counts
+calculate_stats() {
+    local partition_counts=("$@")
+    local total=0
+    local count=${#partition_counts[@]}
+    local max=0
+    local min=${partition_counts[0]}
+
+    for partitions in "${partition_counts[@]}"; do
+        total=$((total + partitions))
+        if [ "$partitions" -gt "$max" ]; then
+            max=$partitions
+        fi
+        if [ "$partitions" -lt "$min" ]; then
+            min=$partitions
+        fi
+    done
+
+    local avg=$((total / count))
+    
+    echo "$total $count $max $min $avg"
+}
+
+# Function to calculate next multiple of 3
+next_multiple_of_3() {
+    local num=$1
+    echo $(( (num + 2) / 3 * 3 ))
+}
+
+# Function to calculate when expansion will be needed
+calculate_expansion_timing() {
+    local current_max_partitions=$1
+    local growth_rate_percent=$2
+    local health_threshold=$3
+    
+    if [ "$current_max_partitions" -ge "$health_threshold" ]; then
+        echo "0"  # Immediate expansion needed
+        return
+    fi
+    
+    # Calculate months until health threshold is reached
+    local remaining_capacity=$((health_threshold - current_max_partitions))
+    local monthly_growth=$((current_max_partitions * growth_rate_percent / 1200))  # /1200 = /12/100
+    
+    if [ "$monthly_growth" -le 0 ]; then
+        echo "999"  # Never needs expansion with no growth
+        return
+    fi
+    
+    local months_until_expansion=$((remaining_capacity / monthly_growth))
+    echo "$months_until_expansion"
+}
+
+# Function to calculate expansion sustainability
+calculate_expansion_sustainability() {
+    local current_total_partitions=$1
+    local new_broker_count=$2
+    local growth_rate_percent=$3
+    local health_threshold=$4
+    
+    # Calculate average partitions per broker after expansion
+    local avg_after_expansion=$((current_total_partitions / new_broker_count))
+    
+    # Estimate max partitions per broker after expansion (avg + 25% for imbalance)
+    local max_after_expansion=$((avg_after_expansion + avg_after_expansion * 25 / 100))
+    
+    # Calculate months this expansion will sustain growth
+    local remaining_capacity_after_expansion=$((health_threshold - max_after_expansion))
+    local monthly_growth=$((current_total_partitions * growth_rate_percent / 1200 / new_broker_count))
+    
+    if [ "$monthly_growth" -le 0 ] || [ "$remaining_capacity_after_expansion" -le 0 ]; then
+        if [ "$max_after_expansion" -ge "$health_threshold" ]; then
+            echo "0"  # Expansion insufficient
+        else
+            echo "999"  # Sustainable indefinitely
+        fi
+        return
+    fi
+    
+    local sustainability_months=$((remaining_capacity_after_expansion / monthly_growth))
+    echo "$sustainability_months"
+}
+
+# Function to calculate next expansion timing after current expansion
+calculate_next_expansion_timing() {
+    local current_total_partitions=$1
+    local new_broker_count=$2
+    local growth_rate_percent=$3
+    local health_threshold=$4
+    
+    local sustainability=$(calculate_expansion_sustainability "$current_total_partitions" "$new_broker_count" "$growth_rate_percent" "$health_threshold")
+    
+    if [ "$sustainability" -eq 999 ]; then
+        echo "No further expansion needed (sustainable)"
+    elif [ "$sustainability" -eq 0 ]; then
+        echo "Immediate additional expansion required"
+    else
+        local years=$((sustainability / 12))
+        local months=$((sustainability % 12))
+        if [ "$years" -gt 0 ] && [ "$months" -gt 0 ]; then
+            echo "${years} years, ${months} months"
+        elif [ "$years" -gt 0 ]; then
+            echo "${years} years"
+        else
+            echo "${months} months"
+        fi
+    fi
+}
+
+# Function to calculate months until next contract renewal (September)
+calculate_months_to_contract_renewal() {
+    local current_month=$(date +%m)
+    local current_year=$(date +%Y)
+    
+    # Remove leading zero from month
+    current_month=$((10#$current_month))
+    
+    if [ "$current_month" -le "$CONTRACT_RENEWAL_MONTH" ]; then
+        # Contract renewal is this year
+        echo $(( (CONTRACT_RENEWAL_MONTH - current_month) ))
+    else
+        # Contract renewal is next year
+        echo $(( (12 - current_month) + CONTRACT_RENEWAL_MONTH ))
+    fi
+}
+
+# Function to calculate contract-aware expansion recommendation
+calculate_contract_aware_recommendation() {
+    local timing_until_needed=$1
+    local brokers_to_add=$2
+    local months_to_renewal=$(calculate_months_to_contract_renewal)
+    
+    local cost_per_broker=$(calculate_cost_per_broker "$ENVIRONMENT")
+    local cost_for_additional_brokers=$(echo "scale=2; $brokers_to_add * $cost_per_broker" | bc)
+    local cost_for_full_year=$(echo "scale=2; $brokers_to_add * $cost_per_broker" | bc)
+    
+    local recommendation=""
+    local timing_decision=""
+    
+    if [ "$timing_until_needed" -eq 0 ]; then
+        # Immediate expansion needed
+        recommendation="IMMEDIATE"
+        timing_decision="Expand now - cluster health critical regardless of contract timing"
+    elif [ "$timing_until_needed" -ge "$months_to_renewal" ]; then
+        # Can wait until contract renewal
+        if [ "$months_to_renewal" -le 3 ]; then
+            recommendation="WAIT_FOR_RENEWAL"
+            timing_decision="Wait for contract renewal in $months_to_renewal months - expansion not urgent"
+        else
+            recommendation="EVALUATE_COST"
+            timing_decision="Consider cost: $cost_for_additional_brokers annual license cost vs waiting $months_to_renewal months"
+        fi
+    else
+        # Need to expand before contract renewal
+        local cost_for_additional=$(echo "scale=2; $brokers_to_add * $cost_per_broker" | bc)
+        local cost_threshold=$(echo "scale=2; $cost_per_broker / 6" | bc)
+        if [ "$(echo "$cost_for_additional > $cost_threshold" | bc)" -eq 1 ]; then
+            recommendation="EXPAND_NOW"
+            timing_decision="Expand now - cost difference manageable and expansion needed in $timing_until_needed months"
+        else
+            recommendation="EXPAND_NOW"
+            timing_decision="Expand now - minimal additional cost impact"
+        fi
+    fi
+    
+    echo "$recommendation|$timing_decision|$months_to_renewal|$cost_for_additional_brokers|$cost_for_full_year"
+}
+
+# Function to calculate optimal brokers for full contract year sustainability
+calculate_contract_year_optimal_brokers() {
+    local total_partitions=$1
+    local growth_rate=$2
+    local current_brokers=$3
+    
+    local health_threshold=$((MAX_PARTITIONS_PER_BROKER * HEALTH_THRESHOLD_PERCENT / 100))
+    
+    # Calculate partitions after full year of growth
+    local projected_total_1yr=$((total_partitions * (100 + growth_rate) / 100))
+    
+    # Calculate minimum brokers needed for 1-year health with 25% partition imbalance buffer
+    local min_brokers_for_1yr=$(( (projected_total_1yr * 125 / 100 + health_threshold - 1) / health_threshold ))
+    
+    # Ensure it's a multiple of 3 and at least current+3
+    local optimal_brokers=$(next_multiple_of_3 "$min_brokers_for_1yr")
+    
+    if [ "$optimal_brokers" -le "$current_brokers" ]; then
+        optimal_brokers=$((current_brokers + BROKER_MULTIPLE))
+        optimal_brokers=$(next_multiple_of_3 "$optimal_brokers")
+    fi
+    
+    local brokers_to_add_optimal=$((optimal_brokers - current_brokers))
+    
+    # Calculate if this expansion sustains the full year
+    local avg_after_optimal=$((projected_total_1yr / optimal_brokers))
+    local max_after_optimal=$((avg_after_optimal + avg_after_optimal * 25 / 100))
+    local will_sustain_year="true"
+    
+    if [ "$max_after_optimal" -gt "$health_threshold" ]; then
+        will_sustain_year="false"
+    fi
+    
+    echo "$optimal_brokers|$brokers_to_add_optimal|$will_sustain_year|$max_after_optimal"
+}
+
+# Function to calculate minimum brokers for next contract cycle (14 months with 2-month buffer)
+calculate_next_contract_minimum_brokers() {
+    local total_partitions=$1
+    local growth_rate=$2
+    local current_brokers=$3
+    
+    local health_threshold=$((MAX_PARTITIONS_PER_BROKER * HEALTH_THRESHOLD_PERCENT / 100))
+    
+    # Calculate partitions after 14 months (12 months + 2 month buffer)
+    local projected_total_14mo=$((total_partitions * (100 + growth_rate * 14 / 12) / 100))
+    
+    # Calculate minimum brokers needed for 14-month health with 25% partition imbalance buffer
+    local min_brokers_for_14mo=$(( (projected_total_14mo * 125 / 100 + health_threshold - 1) / health_threshold ))
+    
+    # Ensure it's a multiple of 3 and not less than current broker count
+    local min_contract_brokers=$(next_multiple_of_3 "$min_brokers_for_14mo")
+    
+    if [ "$min_contract_brokers" -lt "$current_brokers" ]; then
+        min_contract_brokers=$current_brokers
+    fi
+    
+    local brokers_to_add_contract=$((min_contract_brokers - current_brokers))
+    
+    echo "$min_contract_brokers|$brokers_to_add_contract"
+}
+
+# Function to parse existing summary file and extract cumulative data
+parse_existing_summary() {
+    local file_path="$1"
+    
+    # Simple parsing approach - just return simplified totals for now
+    local total_add=0
+    local total_cost=0
+    local cluster_count=0
+    local unique_clusters=""
+    
+    if [[ -f "$file_path" ]]; then
+        # Parse existing table rows with new format including Growth Scenario column
+        # Read line by line and then split by pipes
+        while IFS= read -r line; do
+            # Only process lines that look like table rows (start with |)
+            if [[ "$line" =~ ^\|.*\|$ ]]; then
+                # Split line by pipes
+                IFS='|' read -r -a fields <<< "$line"
+                
+                # Need at least 13 fields for a valid table row (added Zookeeper column)
+                if [ ${#fields[@]} -lt 13 ]; then
+                    continue
+                fi
+                
+                local datacenter="${fields[1]}"
+                local clustertype="${fields[2]}"
+                local environment="${fields[3]}"
+                local growth_scenario="${fields[4]}"
+                local zookeepers="${fields[5]}"
+                local current_brokers="${fields[6]}"
+                local additional_brokers="${fields[7]}"
+                local current_cost="${fields[8]}"
+                local additional_cost="${fields[9]}"
+                local total_cost_col="${fields[10]}"
+                local cost_increase="${fields[11]}"
+                local recommended="${fields[12]}"
+                
+                # Skip header lines
+                if [[ "$datacenter" =~ DataCenter ]] || [[ "$datacenter" =~ ^[-]*$ ]]; then
+                    continue
+                fi
+                
+                # Clean up the fields
+                datacenter=$(echo "$datacenter" | tr -d ' ')
+                clustertype=$(echo "$clustertype" | tr -d ' ')
+                environment=$(echo "$environment" | tr -d ' ')
+                additional_brokers=$(echo "$additional_brokers" | tr -d ' ')
+                additional_cost=$(echo "$additional_cost" | tr -d ' $,')
+                recommended=$(echo "$recommended" | tr -d ' ')
+                
+                # Skip empty datacenter
+                if [[ -z "$datacenter" ]]; then
+                    continue
+                fi
+                
+                # Create unique cluster identifier
+                local cluster_id="${datacenter}_${clustertype}_${environment}"
+                
+                # Only count recommended scenarios (rows with YES) for totals
+                if [[ "$recommended" =~ YES ]]; then
+                    total_add=$((total_add + additional_brokers))
+                    total_cost=$(echo "scale=2; $total_cost + $additional_cost" | bc)
+                    
+                    # Count unique clusters
+                    if [[ ! "$unique_clusters" =~ $cluster_id ]]; then
+                        cluster_count=$((cluster_count + 1))
+                        unique_clusters="${unique_clusters} ${cluster_id}"
+                    fi
+                fi
+            fi
+        done < "$file_path"
+    fi
+    
+    echo "$total_add|$total_cost|$cluster_count"
+}
+
+# Function to perform multi-scenario analysis for different growth rates
+perform_multi_scenario_analysis() {
+    local total_partitions=$1
+    local max_partitions=$2
+    local current_brokers=$3
+    
+    local base_result=$(calculate_smart_expansion_with_midterm $total_partitions $max_partitions $current_brokers $ANNUAL_GROWTH_PERCENT)
+    local low_result=$(calculate_smart_expansion_with_midterm $total_partitions $max_partitions $current_brokers $LOW_GROWTH_PERCENT)
+    local high_result=$(calculate_smart_expansion_with_midterm $total_partitions $max_partitions $current_brokers $HIGH_GROWTH_PERCENT)
+    
+    echo "$base_result|SCENARIO_SEPARATOR|$low_result|SCENARIO_SEPARATOR|$high_result"
+}
+
+# Function to calculate smart expansion needs with mid-term analysis
+calculate_smart_expansion_with_midterm() {
+    local total_partitions=$1
+    local max_partitions=$2
+    local current_brokers=$3
+    local growth_rate=${4:-$ANNUAL_GROWTH_PERCENT}
+    
+    local health_threshold=$((MAX_PARTITIONS_PER_BROKER * HEALTH_THRESHOLD_PERCENT / 100))
+    local projected_1yr_max=$((max_partitions * (100 + growth_rate) / 100))
+    local projected_1yr_total=$((total_partitions * (100 + growth_rate) / 100))
+    
+    local expansion_needed=false
+    local immediate_reason=""
+    local expansion_type=""
+    local min_brokers_needed=$current_brokers
+    local brokers_to_add=0
+    local reasoning=""
+    
+    # Step 1: Check if immediate expansion is needed
+    if [ "$max_partitions" -gt "$health_threshold" ]; then
+        expansion_needed=true
+        immediate_reason="Current load exceeds 80% health threshold"
+        expansion_type="URGENT"
+        # Calculate minimum brokers for current health
+        min_brokers_needed=$(( (total_partitions + health_threshold - 1) / health_threshold ))
+    elif [ "$projected_1yr_max" -gt "$health_threshold" ]; then
+        expansion_needed=true
+        immediate_reason="Projected 1-year growth will exceed 80% health threshold"
+        expansion_type="PLANNED"
+        # Calculate minimum brokers for 1-year projection
+        min_brokers_needed=$(( (projected_1yr_total + health_threshold - 1) / health_threshold ))
+    fi
+    
+    if [ "$expansion_needed" = true ]; then
+        # Ensure it's at least current + 3 and multiple of 3
+        if [ "$min_brokers_needed" -le "$current_brokers" ]; then
+            min_brokers_needed=$((current_brokers + BROKER_MULTIPLE))
+        fi
+        min_brokers_needed=$(next_multiple_of_3 "$min_brokers_needed")
+        
+        # Step 2: Check if this expansion will be sufficient for the next year
+        local initial_brokers_to_add=$((min_brokers_needed - current_brokers))
+        local projected_avg_after_expansion=$((projected_1yr_total / min_brokers_needed))
+        local projected_max_after_expansion=$((projected_avg_after_expansion + projected_avg_after_expansion * 25 / 100))
+        
+        # Step 3: If the expansion won't be sufficient for the year, add more brokers
+        if [ "$projected_max_after_expansion" -gt "$health_threshold" ]; then
+            # Recalculate to ensure 1-year health
+            local better_brokers_needed=$(( (projected_1yr_total + health_threshold - 1) / health_threshold ))
+            better_brokers_needed=$(next_multiple_of_3 "$better_brokers_needed")
+            
+            # Add extra buffer if still close to threshold
+            if [ "$better_brokers_needed" -eq "$min_brokers_needed" ]; then
+                better_brokers_needed=$((better_brokers_needed + BROKER_MULTIPLE))
+            fi
+            
+            min_brokers_needed=$better_brokers_needed
+            expansion_type="${expansion_type}_ENHANCED"
+            immediate_reason="$immediate_reason (enhanced to ensure 1-year stability)"
+        fi
+        
+        brokers_to_add=$((min_brokers_needed - current_brokers))
+        
+        # Step 4: Calculate mid-term expansion needs
+        local total_after_expansion=$((total_partitions))  # Current total for immediate calculation
+        local max_after_expansion=$((total_after_expansion / min_brokers_needed + (total_after_expansion / min_brokers_needed) * 25 / 100))  # Estimated max after expansion
+        local midterm_result=$(calculate_midterm_expansion $projected_1yr_total $projected_max_after_expansion $min_brokers_needed)
+        IFS='|' read -r midterm_needed midterm_brokers midterm_reason midterm_projected_max midterm_projected_total <<< "$midterm_result"
+        
+        local total_brokers_needed=$min_brokers_needed
+        local total_expansion=$brokers_to_add
+        
+        if [ "$midterm_needed" = "true" ]; then
+            total_brokers_needed=$((min_brokers_needed + midterm_brokers))
+            total_expansion=$((brokers_to_add + midterm_brokers))
+            expansion_type="${expansion_type}_WITH_MIDTERM"
+            immediate_reason="$immediate_reason (includes mid-term expansion to avoid 6-month re-expansion)"
+        fi
+        
+        # Step 5: Generate reasoning
+        case $expansion_type in
+            "URGENT")
+                reasoning="Immediate expansion required due to current health threshold breach. Adding $brokers_to_add brokers will restore cluster health and handle projected growth for the next year."
+                ;;
+            "PLANNED")
+                reasoning="Proactive expansion recommended to handle projected 15% annual growth. Adding $brokers_to_add brokers now prevents mid-year capacity issues."
+                ;;
+            "URGENT_ENHANCED")
+                reasoning="Immediate expansion required due to current health threshold breach. Enhanced from initial calculation to $brokers_to_add brokers to ensure the cluster remains healthy throughout the next year with projected growth."
+                ;;
+            "PLANNED_ENHANCED")
+                reasoning="Proactive expansion recommended for projected growth. Enhanced to $brokers_to_add brokers to ensure the expansion will be sufficient for the entire next year, avoiding mid-year re-expansion."
+                ;;
+            *"_WITH_MIDTERM")
+                reasoning="$reasoning Additionally, mid-term analysis shows $midterm_brokers more brokers will be needed in 6 months. Total expansion of $total_expansion brokers recommended to avoid multiple expansions."
+                ;;
+        esac
+        
+        # Calculate timing and sustainability metrics
+        local timing_until_needed=$(calculate_expansion_timing $max_partitions $growth_rate $health_threshold)
+        local sustainability_months=$(calculate_expansion_sustainability $total_partitions $total_brokers_needed $growth_rate $health_threshold)
+        local next_expansion_timing=$(calculate_next_expansion_timing $total_partitions $total_brokers_needed $growth_rate $health_threshold)
+        
+        echo "$expansion_needed|$immediate_reason|$expansion_type|$min_brokers_needed|$brokers_to_add|$reasoning|$projected_1yr_max|$projected_1yr_total|$midterm_needed|$midterm_brokers|$total_brokers_needed|$total_expansion|$timing_until_needed|$sustainability_months|$next_expansion_timing"
+    else
+        expansion_type="NONE"
+        reasoning="No expansion needed. Current cluster can handle projected ${growth_rate}% annual growth while maintaining healthy partition distribution (max partitions per broker will remain under 80% threshold)."
+        local timing_until_needed=$(calculate_expansion_timing $max_partitions $growth_rate $health_threshold)
+        echo "$expansion_needed|N/A|$expansion_type|$current_brokers|0|$reasoning|$projected_1yr_max|$projected_1yr_total|false|0|$current_brokers|0|$timing_until_needed|999|No expansion needed"
+    fi
+}
+
+
+# Function to create detailed multi-scenario analysis
+create_multi_scenario_analysis() {
+    local stats=("$@")
+    
+    local total_partitions=${stats[0]}
+    local current_brokers=${stats[1]}
+    local max_partitions=${stats[2]}
+    local min_partitions=${stats[3]}
+    local avg_partitions=${stats[4]}
+    
+    # Calculate thresholds and basic projections
+    local health_threshold=$((MAX_PARTITIONS_PER_BROKER * HEALTH_THRESHOLD_PERCENT / 100))
+    local current_utilization=$((max_partitions * 100 / MAX_PARTITIONS_PER_BROKER))
+    local health_utilization=$((max_partitions * 100 / health_threshold))
+    
+    # Determine health status
+    local status_icon="✅"
+    local status_text="HEALTHY"
+    
+    if [ "$max_partitions" -gt "$health_threshold" ]; then
+        status_icon="⚠️"
+        status_text="UNHEALTHY"
+    elif [ "$max_partitions" -gt $((health_threshold * 90 / 100)) ]; then
+        status_icon="⚠️"
+        status_text="WARNING"
+    fi
+    
+    # Create detailed analysis content
+    local analysis_content=""
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local section_header="${DATACENTER}_${CLUSTER_TYPE}_${ENVIRONMENT}"
+    
+    analysis_content+="# $section_header - Multi-Scenario Analysis\n\n"
+    analysis_content+="**Analysis Date:** $timestamp\n\n"
+    
+    analysis_content+="## Current Cluster Status\n\n"
+    analysis_content+="| Metric | Value |\n"
+    analysis_content+="|--------|-------|\n"
+    analysis_content+="| Total Brokers | $current_brokers |\n"
+    analysis_content+="| Total Partitions | $total_partitions |\n"
+    analysis_content+="| Max Partitions per Broker | $max_partitions |\n"
+    analysis_content+="| Min Partitions per Broker | $min_partitions |\n"
+    analysis_content+="| Average Partitions per Broker | $avg_partitions |\n\n"
+    
+    analysis_content+="## Current Health Status\n\n"
+    analysis_content+="| Metric | Value |\n"
+    analysis_content+="|--------|-------|\n"
+    analysis_content+="| Max Broker Utilization | ${current_utilization}% |\n"
+    analysis_content+="| Health Threshold Utilization | ${health_utilization}% |\n"
+    analysis_content+="| Status | $status_icon **$status_text**: Max partitions $([ "$max_partitions" -gt "$health_threshold" ] && echo "exceed" || echo "within") 80% threshold |\n\n"
+    
+    # Add contract timing context
+    local months_to_renewal=$(calculate_months_to_contract_renewal)
+    analysis_content+="## 💰 Contract & Cost Context\n\n"
+    analysis_content+="| Item | Value |\n"
+    analysis_content+="|------|-------|\n"
+    analysis_content+="| Current Date | $(date '+%B %Y') |\n"
+    analysis_content+="| Contract Renewal | September (in $months_to_renewal months) |\n"
+    local cost_per_broker=$(calculate_cost_per_broker "$ENVIRONMENT")
+    analysis_content+="| Cost per Broker | \$${cost_per_broker}/year |\n\n"
+    
+    # Analyze each growth scenario
+    local scenarios=("$LOW_GROWTH_PERCENT:Conservative" "$ANNUAL_GROWTH_PERCENT:Base" "$HIGH_GROWTH_PERCENT:Aggressive")
+    
+    for scenario in "${scenarios[@]}"; do
+        IFS=':' read -r growth_rate scenario_name <<< "$scenario"
+        
+        local expansion_result=$(calculate_smart_expansion_with_midterm $total_partitions $max_partitions $current_brokers $growth_rate)
+        IFS='|' read -r expansion_needed immediate_reason expansion_type min_brokers_needed brokers_to_add reasoning projected_1yr_max projected_1yr_total midterm_needed midterm_brokers total_brokers_needed total_expansion timing_until_needed sustainability_months next_expansion_timing <<< "$expansion_result"
+        
+        analysis_content+="## ${scenario_name} Growth Scenario (${growth_rate}%)\n\n"
+        analysis_content+="| Metric | Value |\n"
+        analysis_content+="|--------|-------|\n"
+        analysis_content+="| Projected Max (1-year) | $projected_1yr_max |\n"
+        analysis_content+="| Projected Total (1-year) | $projected_1yr_total |\n\n"
+        
+        if [ "$expansion_needed" = "true" ]; then
+            local expansion_icon=""
+            case $expansion_type in
+                "URGENT"*) expansion_icon="🚨" ;;
+                "PLANNED"*) expansion_icon="📈" ;;
+            esac
+            
+            # Get contract-aware recommendation
+            local contract_result=$(calculate_contract_aware_recommendation $timing_until_needed $total_expansion)
+            IFS='|' read -r contract_recommendation timing_decision renewal_months cost_remaining cost_full_year <<< "$contract_result"
+            
+            # Get next contract minimum
+            local next_contract_result=$(calculate_next_contract_minimum_brokers $total_partitions $growth_rate $current_brokers)
+            IFS='|' read -r next_contract_brokers next_contract_add <<< "$next_contract_result"
+            
+            analysis_content+="### $expansion_icon Expansion Required\n\n"
+            analysis_content+="| Item | Value |\n"
+            analysis_content+="|------|-------|\n"
+            analysis_content+="| Expansion Type | $expansion_type |\n"
+            analysis_content+="| Brokers to Add | $total_expansion |\n"
+            analysis_content+="| Final Broker Count | $total_brokers_needed |\n"
+            
+            if [ "$timing_until_needed" -eq 0 ]; then
+                analysis_content+="| ⏰ Timing | Immediate expansion required |\n"
+            elif [ "$timing_until_needed" -eq 999 ]; then
+                analysis_content+="| ⏰ Timing | No expansion needed |\n"
+            else
+                local years=$((timing_until_needed / 12))
+                local months=$((timing_until_needed % 12))
+                if [ "$years" -gt 0 ] && [ "$months" -gt 0 ]; then
+                    analysis_content+="| ⏰ Timing | Expansion needed in ${years} years, ${months} months |\n"
+                elif [ "$years" -gt 0 ]; then
+                    analysis_content+="| ⏰ Timing | Expansion needed in ${years} years |\n"
+                else
+                    analysis_content+="| ⏰ Timing | Expansion needed in ${months} months |\n"
+                fi
+            fi
+            
+            analysis_content+="| 📅 Next Expansion | $next_expansion_timing |\n\n"
+            
+            # Add contract and cost analysis
+            analysis_content+="### Contract Analysis\n\n"
+            analysis_content+="| Item | Value |\n"
+            analysis_content+="|------|-------|\n"
+            analysis_content+="| 💰 Contract Timing Recommendation | **$contract_recommendation** |\n"
+            analysis_content+="| 💡 Decision | $timing_decision |\n"
+            analysis_content+="| 💵 Cost if expanded now | \$${cost_remaining} (remaining contract) + \$${cost_full_year}/year |\n"
+            analysis_content+="| 🎯 **Next Contract Minimum** | **Add $next_contract_add → $next_contract_brokers brokers** |\n"
+            analysis_content+="| 📋 Sustainability | Sustains until Nov 2026 (14 months with buffer) |\n\n"
+        else
+            analysis_content+="### ✅ No Expansion Needed\n\n"
+            analysis_content+="Current cluster can handle ${growth_rate}% growth\n\n"
+        fi
+    done
+    
+    # Add final recommendation section
+    analysis_content+="## 🎯 Final Recommendation\n\n"
+    analysis_content+="Based on the multi-scenario analysis above, here are the optimal expansion recommendations:\n\n"
+    
+    # Calculate the minimum broker recommendation across all scenarios for next contract
+    local min_next_contract_brokers=999
+    local min_scenario=""
+    for scenario in "${scenarios[@]}"; do
+        IFS=':' read -r growth_rate scenario_name <<< "$scenario"
+        local next_contract_result=$(calculate_next_contract_minimum_brokers $total_partitions $growth_rate $current_brokers)
+        IFS='|' read -r next_contract_brokers next_contract_add <<< "$next_contract_result"
+        
+        if [ "$next_contract_brokers" -lt "$min_next_contract_brokers" ]; then
+            min_next_contract_brokers=$next_contract_brokers
+            min_scenario="$scenario_name ($growth_rate%)"
+        fi
+    done
+    
+    local min_add=$((min_next_contract_brokers - current_brokers))
+    local cost_per_broker=$(calculate_cost_per_broker "$ENVIRONMENT")
+    local min_cost_annual=$(echo "scale=2; $min_add * $cost_per_broker" | bc)
+    
+    analysis_content+="### 💡 Minimum Contract Expansion\n\n"
+    analysis_content+="| Item | Value |\n"
+    analysis_content+="|------|-------|\n"
+    analysis_content+="| **Minimum brokers for next contract** | **$min_next_contract_brokers brokers (add $min_add)** |\n"
+    analysis_content+="| **Based on scenario** | $min_scenario |\n"
+    analysis_content+="| **Sustains until** | November 2026 (14 months with 2-month buffer) |\n"
+    analysis_content+="| **Cost impact** | \$${min_cost_annual}/year additional |\n"
+    analysis_content+="| **Recommendation** | Add **$min_add brokers** to sustain growth through next contract cycle |\n\n"
+    
+    analysis_content+="---\n\n"
+    
+    echo -e "$analysis_content"
+}
+
+# Function to create markdown tabular summary header
+create_tabular_header() {
+    echo "| DataCenter | ClusterType | Environment | Growth Scenario | Zookeepers | Current Brokers | Additional Brokers | Current Cost (Annual) | Additional Cost (Annual) | Total Cost (Annual) | Cost Increase % | **Recommended** |"
+    echo "|------------|-------------|-------------|-----------------|------------|-----------------|--------------------|-----------------------|--------------------------|---------------------|-----------------|-----------------|"
+}
+
+# Function to create tabular summary row for a specific growth rate
+create_tabular_row_for_growth() {
+    local growth_rate=$1
+    local scenario_name=$2
+    local is_recommended=$3
+    shift 3
+    local stats=("$@")
+    
+    local total_partitions=${stats[0]}
+    local current_brokers=${stats[1]}
+    local max_partitions=${stats[2]}
+    local min_partitions=${stats[3]}
+    local avg_partitions=${stats[4]}
+    
+    # Calculate all derived values
+    local health_threshold=$((MAX_PARTITIONS_PER_BROKER * HEALTH_THRESHOLD_PERCENT / 100))
+    local current_utilization=$((max_partitions * 100 / MAX_PARTITIONS_PER_BROKER))
+    local health_utilization=$((max_partitions * 100 / health_threshold))
+    
+    # Get smart expansion analysis with mid-term for this growth rate
+    local expansion_result=$(calculate_smart_expansion_with_midterm $total_partitions $max_partitions $current_brokers $growth_rate)
+    IFS='|' read -r expansion_needed immediate_reason expansion_type min_brokers_needed brokers_to_add reasoning projected_1yr_max projected_1yr_total midterm_needed midterm_brokers total_brokers_needed total_expansion timing_until_needed sustainability_months next_expansion_timing <<< "$expansion_result"
+    
+    # Get contract recommendation
+    local contract_recommendation="N/A"
+    local cost_remaining="0"
+    if [ "$expansion_needed" = "true" ]; then
+        local contract_result=$(calculate_contract_aware_recommendation $timing_until_needed $total_expansion)
+        IFS='|' read -r contract_recommendation timing_decision renewal_months cost_remaining cost_full_year <<< "$contract_result"
+    fi
+    
+    # Get next contract minimum recommendation
+    local next_contract_result=$(calculate_next_contract_minimum_brokers $total_partitions $growth_rate $current_brokers)
+    IFS='|' read -r next_contract_brokers next_contract_add <<< "$next_contract_result"
+    
+    local next_contract_recommendation="**Add ${next_contract_add} → ${next_contract_brokers} brokers**"
+    
+    # Set recommendation checkmark
+    local recommendation_mark=""
+    if [ "$is_recommended" = "true" ]; then
+        recommendation_mark="✅ **YES**"
+    else
+        recommendation_mark=""
+    fi
+    
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    # Calculate costs based on environment (including Zookeeper nodes)
+    local cost_per_broker=$(calculate_cost_per_broker "$ENVIRONMENT")
+    local zookeeper_count=3  # Always 3 zookeepers per cluster
+    local zookeeper_annual_cost=$(echo "scale=2; $zookeeper_count * $cost_per_broker" | bc)
+    local current_brokers_annual_cost=$(echo "scale=2; $current_brokers * $cost_per_broker" | bc)
+    local current_annual_cost=$(echo "scale=2; $zookeeper_annual_cost + $current_brokers_annual_cost" | bc)
+    local additional_annual_cost=$(echo "scale=2; $next_contract_add * $cost_per_broker" | bc)
+    local total_annual_cost=$(echo "scale=2; $current_annual_cost + $additional_annual_cost" | bc)
+    local cost_increase_percent=0
+    if [ "$(echo "$current_annual_cost > 0" | bc)" -eq 1 ]; then
+        cost_increase_percent=$(echo "scale=0; $additional_annual_cost * 100 / $current_annual_cost" | bc)
+    fi
+    
+    echo "| $DATACENTER | $CLUSTER_TYPE | $ENVIRONMENT | $scenario_name ($growth_rate%) | $zookeeper_count | $current_brokers | $next_contract_add | \$$(printf "%.2f" $current_annual_cost) | \$$(printf "%.2f" $additional_annual_cost) | \$$(printf "%.2f" $total_annual_cost) | ${cost_increase_percent}% | $recommendation_mark |"
+}
+
+# Function to analyze cluster and create outputs
+analyze_cluster() {
+    local input_data="$1"
+    
+    # Parse partition counts into array
+    local partition_counts=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[0-9]+$ ]] && [ "$line" -gt 0 ]; then
+            partition_counts+=("$line")
+        fi
+    done <<< "$input_data"
+    
+    if [ ${#partition_counts[@]} -eq 0 ]; then
+        print_colored "$RED" "❌ Error: No valid partition counts found in input data"
+        exit 1
+    fi
+    
+    print_colored "$GREEN" "✅ Processing ${#partition_counts[@]} broker partition counts..."
+    print_colored "$PURPLE" "🧠 Using multi-scenario planning (${LOW_GROWTH_PERCENT}%, ${ANNUAL_GROWTH_PERCENT}%, ${HIGH_GROWTH_PERCENT}% growth rates)..."
+    echo
+    
+    # Calculate current statistics
+    local stats=($(calculate_stats "${partition_counts[@]}"))
+    
+    # Create and display multi-scenario detailed analysis
+    local detailed_analysis=$(create_multi_scenario_analysis "${stats[@]}")
+    echo -e "$detailed_analysis"
+    
+    # Append detailed analysis to file
+    echo -e "$detailed_analysis" >> "$DETAILED_FILE"
+    
+    # Parse existing data for cumulative calculations
+    local existing_totals=$(parse_existing_summary "$TABULAR_FILE")
+    local existing_total_add=0
+    local existing_total_cost=0
+    local existing_cluster_count=0
+    
+    if [[ -n "$existing_totals" ]]; then
+        IFS='|' read -r existing_total_add existing_total_cost existing_cluster_count <<< "$existing_totals"
+    fi
+    
+    # Create header if file doesn't exist
+    if [ ! -f "$TABULAR_FILE" ]; then
+        {
+            echo "# Kafka Cluster Expansion Planning - Multi-Scenario Summary"
+            echo ""
+            echo "**Created:** $(date)"
+            echo ""
+            echo "**Features:** Multi-scenario analysis (±5% growth), timing prediction, contract optimization"
+            echo ""
+            echo "**Growth Scenarios:** Conservative (${LOW_GROWTH_PERCENT}%), Base (${ANNUAL_GROWTH_PERCENT}%), Aggressive (${HIGH_GROWTH_PERCENT}%)"
+            echo ""
+            local cost_per_broker=$(calculate_cost_per_broker "$ENVIRONMENT")
+            echo "**Contract Context:** Current renewal in $(calculate_months_to_contract_renewal) months (September), cost per broker: \$${cost_per_broker}/year"
+            echo ""
+            echo "## Recommendations Summary"
+            echo ""
+            create_tabular_header
+        } > "$TABULAR_FILE"
+    else
+        # File exists, we'll append new data and update totals
+        print_colored "$YELLOW" "📄 Appending to existing summary file: $TABULAR_FILE"
+    fi
+    
+    # First, determine which scenario has the minimum brokers for next contract
+    local scenarios=("$LOW_GROWTH_PERCENT:Conservative" "$ANNUAL_GROWTH_PERCENT:Base" "$HIGH_GROWTH_PERCENT:Aggressive")
+    local min_next_contract_brokers=999
+    local recommended_scenario=""
+    local recommended_growth_rate=""
+    local recommended_add=0
+    
+    for scenario in "${scenarios[@]}"; do
+        IFS=':' read -r growth_rate scenario_name <<< "$scenario"
+        local next_contract_result=$(calculate_next_contract_minimum_brokers ${stats[0]} $growth_rate ${stats[1]})
+        IFS='|' read -r next_contract_brokers next_contract_add <<< "$next_contract_result"
+        
+        if [ "$next_contract_brokers" -lt "$min_next_contract_brokers" ]; then
+            min_next_contract_brokers=$next_contract_brokers
+            recommended_scenario="$scenario_name"
+            recommended_growth_rate="$growth_rate"
+            recommended_add="$next_contract_add"
+        fi
+    done
+    
+    # Create and append tabular rows for all three scenarios
+    print_colored "$BLUE" "=== MULTI-SCENARIO TABULAR SUMMARY ==="
+    create_tabular_header
+    
+    # Calculate current cluster contribution for all scenarios
+    
+    # Generate rows for all three growth scenarios
+    local cost_per_broker=$(calculate_cost_per_broker "$ENVIRONMENT")
+    local all_tabular_rows=""
+    
+    for scenario in "${scenarios[@]}"; do
+        IFS=':' read -r growth_rate scenario_name <<< "$scenario"
+        
+        # Calculate cost and broker additions for this scenario
+        local next_contract_result=$(calculate_next_contract_minimum_brokers ${stats[0]} $growth_rate ${stats[1]})
+        IFS='|' read -r next_contract_brokers next_contract_add <<< "$next_contract_result"
+        local cost_annual=$(echo "scale=2; $next_contract_add * $cost_per_broker" | bc)
+        
+        # Determine if this is the recommended scenario
+        local is_recommended="false"
+        if [ "$scenario_name" = "$recommended_scenario" ]; then
+            is_recommended="true"
+        fi
+        
+        local tabular_row=$(create_tabular_row_for_growth "$growth_rate" "$scenario_name" "$is_recommended" "${stats[@]}")
+        
+        # Add to collection of rows
+        if [ -n "$all_tabular_rows" ]; then
+            all_tabular_rows="$all_tabular_rows\n$tabular_row"
+        else
+            all_tabular_rows="$tabular_row"
+        fi
+        
+        echo "$tabular_row"
+    done
+    
+    # For existing files, insert all rows after the table header
+    if [ -f "$TABULAR_FILE" ] && grep -q "## 🎯 Cumulative Totals" "$TABULAR_FILE"; then
+        # Find the line number of the table separator and insert after it
+        local header_line=$(grep -n "|------------|" "$TABULAR_FILE" | tail -1 | cut -d: -f1)
+        if [ -n "$header_line" ]; then
+            # Create a temporary file with the new rows inserted
+            local temp_file="${TABULAR_FILE}.temp"
+            local line_count=0
+            local inserted=false
+            
+            while IFS= read -r line; do
+                line_count=$((line_count + 1))
+                echo "$line" >> "$temp_file"
+                
+                # Insert all new rows after the table separator line
+                if [ "$line_count" -eq "$header_line" ] && [ "$inserted" = "false" ]; then
+                    echo -e "$all_tabular_rows" >> "$temp_file"
+                    inserted=true
+                fi
+            done < "$TABULAR_FILE"
+            
+            # Replace the original file with the temp file
+            mv "$temp_file" "$TABULAR_FILE"
+        else
+            # Fallback: insert before cumulative totals
+            sed -i.bak "/## 🎯 Cumulative Totals/i\\
+$(echo -e "$all_tabular_rows")" "$TABULAR_FILE"
+        fi
+    else
+        # New file or no cumulative section yet, just append
+        echo -e "$all_tabular_rows" >> "$TABULAR_FILE"
+    fi
+    echo
+    
+    # Calculate cumulative totals
+    local total_cluster_count=$((existing_cluster_count + 1))
+    local total_brokers_to_add=$((existing_total_add + recommended_add))
+    local total_additional_cost=$(echo "scale=2; $existing_total_cost + $cost_annual" | bc)
+    
+    # Remove old cumulative summary if it exists and add new one
+    sed -i.bak '/## 🎯 Cumulative Totals/,$d' "$TABULAR_FILE" 2>/dev/null || true
+    
+    # Append cumulative summary
+    {
+        echo ""
+        echo "## 🎯 Cumulative Totals"
+        echo ""
+        echo "**Total Clusters Analyzed:** $total_cluster_count"
+        echo ""
+        echo "### 💡 Overall Recommendation"
+        echo ""
+        
+        # Parse environment breakdown from the actual table data
+        echo "### Environment Breakdown:"
+        echo ""
+        
+        # Parse the current table to show environment-specific totals
+        local env_summary=""
+        local grand_total_brokers=0
+        local grand_total_cost=0
+        
+        if [[ -f "$TABULAR_FILE" ]]; then
+            # Parse environment totals and calculate grand totals
+            local env_totals=$(awk -F'|' '
+                BEGIN { 
+                    total_brokers = 0
+                    total_cost = 0
+                }
+                /^\|.*\|.*\|.*\|.*\|.*\|.*\|.*YES.*\|/ {
+                    # Parse table rows with YES recommendation
+                    # Fields: DataCenter | ClusterType | Environment | Growth Scenario | Current Brokers | Additional Brokers | Current Cost | Additional Cost | Total Cost | Cost Increase % | Recommended
+                    gsub(/^[ \t]+|[ \t]+$/, "", $4)  # Clean environment field (4th column)
+                    gsub(/^[ \t]+|[ \t]+$/, "", $7)  # Clean additional brokers field (7th column)  
+                    gsub(/^[ \t]+|[ \t]+$/, "", $9)  # Clean additional cost field (9th column)
+                    gsub(/[\$,]/, "", $9)            # Remove $ and commas from cost
+                    
+                    if ($4 != "Environment" && $7 != "" && $9 != "") {
+                        env_brokers[$4] += $7
+                        env_costs[$4] += $9
+                        total_brokers += $7
+                        total_cost += $9
+                    }
+                }
+                END {
+                    for (env in env_brokers) {
+                        if (env_brokers[env] > 0) {
+                            # Calculate cost per broker for this environment
+                            cost_per_broker = env_costs[env] / env_brokers[env]
+                            printf "**📋 %s Environment:**\n", env
+                            printf "- **Cost per broker:** $%.2f/year\n", cost_per_broker
+                            printf "- **Total brokers to add:** %d\n", env_brokers[env]
+                            printf "- **Total additional annual cost:** $%.2f\n\n", env_costs[env]
+                        }
+                    }
+                    # Print grand totals at the end
+                    printf "GRAND_TOTALS:%d:%.2f\n", total_brokers, total_cost
+                }
+            ' "$TABULAR_FILE")
+            
+            # Extract environment summary and grand totals
+            env_summary=$(echo "$env_totals" | grep -v "GRAND_TOTALS:")
+            local grand_totals_line=$(echo "$env_totals" | grep "GRAND_TOTALS:")
+            
+            if [[ -n "$grand_totals_line" ]]; then
+                IFS=':' read -r _ grand_total_brokers grand_total_cost <<< "$grand_totals_line"
+            fi
+        fi
+        
+        if [[ -n "$env_summary" ]]; then
+            echo "$env_summary"
+        fi
+        
+        if [[ "$grand_total_brokers" -gt 0 ]]; then
+            echo ""
+            echo "**🎯 Grand Total (All Environments):**"
+            echo "- **Total brokers to add:** $grand_total_brokers"
+            echo "- **Total additional annual cost:** \$$(printf "%.2f" $grand_total_cost)"
+        else
+            echo "**🎉 No additional brokers needed across all environments!**"
+            echo "- **Total additional cost:** \$0"
+        fi
+        echo "- **Sustains until:** November 2026 (with 2-month buffer)"
+        echo ""
+        echo "---"
+        echo ""
+        echo "*Last updated: $(date)*"
+    } >> "$TABULAR_FILE"
+    
+    print_colored "$GREEN" "📄 Files updated successfully:"
+    print_colored "$GREEN" "  📄 Detailed Analysis: $DETAILED_FILE"
+    print_colored "$GREEN" "  📊 Tabular Summary: $TABULAR_FILE"
+}
+
+# Main execution
+main() {
+    local input_data=""
+    
+    # Check command line arguments first
+    if [ $# -eq 0 ]; then
+        print_colored "$RED" "❌ Error: No input file specified"
+        echo
+        show_usage
+        exit 1
+    elif [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+        show_usage
+        exit 0
+    elif [ "$1" = "--example" ]; then
+        # Step 1: Read from environment variables
+        read_from_environment
+        
+        # Step 2: Get missing inputs from user
+        get_missing_inputs
+        
+        # Step 3: Finalize configuration (includes duplicate check)
+        finalize_configuration
+        
+        # Use example data for testing
+        print_colored "$YELLOW" "📊 Using built-in example data for testing..."
+        input_data="3178
+3247
+3121
+2876
+3332
+3007
+3343
+3092
+2909
+3378
+2913
+3061
+3230
+2997"
+    else
+        # Regular file input mode
+        local partition_file="$1"
+        
+        # Step 1: Read from environment variables
+        read_from_environment
+        
+        # Step 2: Get missing inputs from user
+        get_missing_inputs
+        
+        # Step 3: Finalize configuration (includes duplicate check)
+        finalize_configuration
+        
+        # Step 4: Read partition data from file
+        input_data=$(read_partition_file "$partition_file")
+    fi
+    
+    # Verify we have input data
+    if [[ -z "$input_data" ]]; then
+        print_colored "$RED" "❌ Error: No partition data available"
+        exit 1
+    fi
+    
+    analyze_cluster "$input_data"
+    
+}
+
+# Run main function with all arguments
+main "$@"
